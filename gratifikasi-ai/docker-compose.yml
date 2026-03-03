@@ -1,0 +1,128 @@
+version: "3.9"
+
+services:
+  # ── Infrastructure ────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gratifikasi}
+      POSTGRES_USER: ${POSTGRES_USER:-gratifikasi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gratifikasi}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+
+  # ── Application ───────────────────────────────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: infra/docker/web.Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    command: >
+      sh -c "uv run python apps/web/manage.py migrate --noinput &&
+             uv run gunicorn web.wsgi:application
+               --bind 0.0.0.0:8000
+               --workers 4
+               --timeout 120
+               --access-logfile -"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+  ai:
+    build:
+      context: .
+      dockerfile: infra/docker/ai.Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    command: >
+      uv run uvicorn apps.ai_service.app.main:app
+        --host 0.0.0.0
+        --port 8001
+        --workers 2
+    ports:
+      - "8001:8001"
+    depends_on:
+      - qdrant
+    networks:
+      - backend
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    command: >
+      uv run celery -A apps.web.web.celery worker
+        --loglevel=info
+        --concurrency=4
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+  beat:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    command: >
+      uv run celery -A apps.web.web.celery beat
+        --loglevel=info
+        --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+
+volumes:
+  postgres_data:
+  qdrant_data:
+
+networks:
+  backend:
+    driver: bridge
